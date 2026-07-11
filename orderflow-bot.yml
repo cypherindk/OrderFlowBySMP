@@ -1,0 +1,55 @@
+name: Order Flow Bot
+
+on:
+  schedule:
+    # Her 6 saatte bir tetiklenir (00:00, 06:00, 12:00, 18:00 UTC).
+    # Job kendi içinde 350dk (5s50d) sonra durur, bu yüzden bir sonraki
+    # tetiklemeye kadar ~10dk'lık kısa bir kopukluk olur.
+    - cron: "0 */6 * * *"
+  workflow_dispatch:
+    inputs:
+      symbol:
+        description: "Sembol (örn: btcusdt, ethusdt)"
+        required: false
+        default: "btcusdt"
+      score_threshold:
+        description: "Sinyal skor eşiği (0-1)"
+        required: false
+        default: "0.6"
+      require_confluence:
+        description: "Sadece VP seviyesine yakınken alert gönder"
+        type: boolean
+        required: false
+        default: false
+
+concurrency:
+  group: orderflow-bot
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350   # GitHub'ın 360dk (6 saat) sert sınırından önce kendi isteğimizle bitir
+    steps:
+      - name: Repo checkout
+        uses: actions/checkout@v4
+
+      - name: Python kur
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Bağımlılıkları yükle
+        run: pip install -r requirements.txt
+
+      - name: Botu çalıştır
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
+        run: |
+          ARGS="--symbol ${{ github.event.inputs.symbol || 'btcusdt' }} --score-threshold ${{ github.event.inputs.score_threshold || '0.6' }}"
+          if [ "${{ github.event.inputs.require_confluence }}" = "true" ]; then
+            ARGS="$ARGS --require-confluence"
+          fi
+          python orderflow_bot.py $ARGS
