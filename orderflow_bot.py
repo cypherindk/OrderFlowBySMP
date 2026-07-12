@@ -116,6 +116,8 @@ def send_telegram(text: str) -> None:
         }, timeout=10)
         if r.status_code != 200:
             log.error("Telegram gönderim hatası: %s", r.text)
+        else:
+            log.info("Telegram mesajı başarıyla gönderildi (chat_id=%s)", CFG.telegram_chat_id)
     except Exception as e:
         log.error("Telegram gönderim istisnası: %s", e)
 
