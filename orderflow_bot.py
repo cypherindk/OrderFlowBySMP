@@ -397,13 +397,27 @@ def nearest_level_info(price: float) -> dict:
 # ================== SİNYAL DEĞERLENDİRME DÖNGÜSÜ ==================
 
 async def signal_loop():
+    loop_count = 0
     while True:
         await asyncio.sleep(CFG.eval_interval_sec)
+        loop_count += 1
+
         if STATE.last_price == 0:
             continue
 
         result = compute_combined_score()
         score = result["score"]
+
+        # Her ~60 saniyede bir (eval_interval_sec=5 varsayılanla 12 döngü) anlık durumu logla,
+        # eşik geçilmese bile ne olduğunu görebilesin.
+        if loop_count % max(int(60 / CFG.eval_interval_sec), 1) == 0:
+            log.info(
+                "DURUM: fiyat=%.2f skor=%.2f (imbalance=%.2f delta_norm=%.2f absorb=%.2f diverg=%.2f) "
+                "trade_sayisi=%d bid_seviye=%d ask_seviye=%d",
+                result["price"], score, result["imbalance"], result["delta_norm"],
+                result["absorption"], result["divergence"], len(STATE.trades),
+                len(STATE.local_bids), len(STATE.local_asks),
+            )
 
         direction = 0
         if score >= CFG.combined_score_threshold:
@@ -544,6 +558,12 @@ async def main():
 
     log.info("Başlatılıyor: symbol=%s, threshold=%.2f, require_confluence=%s",
               CFG.symbol, CFG.combined_score_threshold, CFG.require_level_confluence)
+
+    send_telegram(
+        f"🤖 Bot başladı: <b>{CFG.symbol}</b> (Kraken Futures)\n"
+        f"Skor eşiği: {CFG.combined_score_threshold}\n"
+        f"Bu bir test mesajıdır, Telegram bağlantısının çalıştığını doğrular."
+    )
 
     await asyncio.gather(
         stream_listener(),
