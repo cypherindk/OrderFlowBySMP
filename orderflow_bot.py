@@ -1,11 +1,12 @@
 """
-Binance Futures Order Flow + Volume Profile -> Telegram Sinyal Botu
+Kraken Futures Order Flow + Volume Profile -> Telegram Sinyal Botu
 ----------------------------------------------------------------------
-Gerçek zamanlı emir akışı (aggTrade) ve orderbook (depth) verisiyle
-imbalance, absorbsiyon ve delta divergence hesaplar; buna ek olarak
-REST klines üzerinden POC/VAH/VAL/HVN/LVN içeren bir hacim profili
-oluşturur. Fiyat bu seviyelere yakınken order flow sinyali teyit
-ediliyorsa Telegram'a zenginleştirilmiş bir alert gönderir.
+Kraken Futures'ın PUBLIC REST + WebSocket API'lerini kullanır. Hesap/API
+key GEREKMEZ. Kraken ABD'de yasal olarak hizmet verdiği için Binance/Bybit'in
+aksine ABD merkezli IP'leri (GitHub Actions runner'ları dahil) bloklamaz.
+
+Kraken'in trade feed'i gerçek taker yönünü (`side: buy`/`sell`) doğrudan
+veriyor -- Binance'teki gibi OHLC'den tahmin etmeye gerek yok.
 
 Kurulum:
     pip install websockets requests
@@ -13,14 +14,12 @@ Kurulum:
 Çalıştırma:
     export TELEGRAM_BOT_TOKEN="123456:ABC..."
     export TELEGRAM_CHAT_ID="123456789"
-    # opsiyonel (gerekli değil, sadece REST rate-limit için ekleniyor):
-    export BINANCE_API_KEY="..."
-    python orderflow_bot.py --symbol btcusdt --score-threshold 0.6
+    python orderflow_bot.py --symbol PI_XBTUSD --score-threshold 0.6
 
-Not: Binance Futures public marketdata stream'leri (aggTrade, depth, klines)
-API key GEREKTİRMEZ. BINANCE_API_KEY tamamen opsiyoneldir, verilirse sadece
-REST isteklerine X-MBX-APIKEY header'ı olarak eklenir. Bu script sadece
-analiz/alert amaçlıdır, otomatik emir GÖNDERMEZ, trade AÇMAZ/KAPATMAZ.
+Sembol notu: PI_XBTUSD = Bitcoin perpetual (inverse). Güncel sembol listesi
+için: https://futures.kraken.com/derivatives/api/v3/instruments
+
+Bu script sadece analiz/alert amaçlıdır, otomatik emir GÖNDERMEZ.
 """
 
 import asyncio
@@ -31,40 +30,40 @@ import argparse
 import logging
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque, List, Tuple
+from typing import Deque, Dict, List
 
 import requests
 import websockets
 
 # ================== AYARLAR ==================
 
-BINANCE_FUTURES_WS = "wss://fstream.binance.com/stream"
+KRAKEN_FUTURES_WS = "wss://futures.kraken.com/ws/v1"
+KRAKEN_FUTURES_REST = "https://futures.kraken.com/derivatives/api/v3"
 
 
 @dataclass
 class Config:
-    symbol: str = "btcusdt"
-    depth_levels: int = 20                     # depth20 stream
-    eval_interval_sec: float = 5.0              # sinyal değerlendirme sıklığı
-    delta_window_sec: int = 60                  # delta/divergence lookback penceresi
-    absorption_window_sec: int = 15             # absorbsiyon tespiti penceresi
-    absorption_price_range_pct: float = 0.05    # % - bu aralığın altı "dar range" sayılır
-    combined_score_threshold: float = 0.6       # -1..1, alert eşiği
-    alert_cooldown_sec: int = 120               # aynı yönde tekrar alert bekleme süresi
+    symbol: str = "PI_XBTUSD"
+    depth_levels: int = 20                      # imbalance için üst N seviye
+    eval_interval_sec: float = 5.0               # sinyal değerlendirme sıklığı
+    delta_window_sec: int = 60                   # delta/divergence lookback penceresi
+    absorption_window_sec: int = 15              # absorbsiyon tespiti penceresi
+    absorption_price_range_pct: float = 0.05     # % - bu aralığın altı "dar range" sayılır
+    combined_score_threshold: float = 0.6        # -1..1, alert eşiği
+    alert_cooldown_sec: int = 120                # aynı yönde tekrar alert bekleme süresi
     telegram_bot_token: str = os.getenv("TELEGRAM_BOT_TOKEN", "")
     telegram_chat_id: str = os.getenv("TELEGRAM_CHAT_ID", "")
 
-    # ---- Hacim Profili (REST klines tabanlı) ----
-    binance_api_key: str = os.getenv("BINANCE_API_KEY", "")   # opsiyonel, sadece header için
-    profile_interval: str = "1m"           # klines interval
-    profile_limit: int = 500               # kaç mum kullanılacak (500x1m ~ 8 saat)
-    profile_bins: int = 24                 # fiyat aralığı sayısı
-    profile_refresh_sec: int = 60          # profili kaç saniyede bir yeniden hesapla
-    va_percent: float = 70.0               # value area %
-    hvn_mult: float = 1.5                  # HVN eşik çarpanı (ortalamaya göre)
-    lvn_mult: float = 0.5                  # LVN eşik çarpanı (ortalamaya göre)
-    price_proximity_pct: float = 0.15      # fiyat bir VP seviyesine bu % kadar yakınsa "teyit" sayılır
-    require_level_confluence: bool = False  # True ise sadece VP seviyesine yakınken alert gönder
+    # ---- Hacim Profili (REST trade history tabanlı, gerçek buy/sell) ----
+    profile_max_trades: int = 2000          # profil için toplanacak toplam trade sayısı
+    profile_max_pages: int = 25             # /history sayfa başı 100 trade, max sayfa
+    profile_bins: int = 24                  # fiyat aralığı sayısı
+    profile_refresh_sec: int = 300          # profili kaç saniyede bir yeniden hesapla
+    va_percent: float = 70.0                # value area %
+    hvn_mult: float = 1.5                   # HVN eşik çarpanı (ortalamaya göre)
+    lvn_mult: float = 0.5                   # LVN eşik çarpanı (ortalamaya göre)
+    price_proximity_pct: float = 0.15       # fiyat bir VP seviyesine bu % kadar yakınsa "teyit"
+    require_level_confluence: bool = False  # True ise sadece VP seviyesine yakınken alert
 
 
 CFG = Config()
@@ -79,16 +78,14 @@ class Trade:
     ts: float
     price: float
     qty: float
-    is_buyer_maker: bool   # True ise satıcı agresif (sell), False ise alıcı agresif (buy)
+    side: str   # "buy" ya da "sell" - Kraken'in verdiği gerçek taker yönü
 
 
 @dataclass
 class State:
     trades: Deque[Trade] = field(default_factory=lambda: deque(maxlen=20000))
-    best_bid: float = 0.0
-    best_ask: float = 0.0
-    bid_levels: List[Tuple[float, float]] = field(default_factory=list)
-    ask_levels: List[Tuple[float, float]] = field(default_factory=list)
+    local_bids: Dict[float, float] = field(default_factory=dict)   # price -> qty
+    local_asks: Dict[float, float] = field(default_factory=dict)   # price -> qty
     last_price: float = 0.0
     last_alert_ts: float = 0.0
     last_alert_dir: int = 0   # 1 = long, -1 = short
@@ -132,17 +129,21 @@ def compute_delta(window_sec: int) -> float:
     for t in reversed(STATE.trades):
         if t.ts < cutoff:
             break
-        if t.is_buyer_maker:
-            sell_vol += t.qty   # buyer maker => aggressor sattı
+        if t.side == "buy":
+            buy_vol += t.qty
         else:
-            buy_vol += t.qty    # buyer taker => aggressor aldı
+            sell_vol += t.qty
     return buy_vol - sell_vol
 
 
 def compute_imbalance() -> float:
     """Orderbook imbalance: -1 (satış baskın) .. +1 (alış baskın)."""
-    bid_vol = sum(q for _, q in STATE.bid_levels[:CFG.depth_levels])
-    ask_vol = sum(q for _, q in STATE.ask_levels[:CFG.depth_levels])
+    if not STATE.local_bids or not STATE.local_asks:
+        return 0.0
+    top_bids = sorted(STATE.local_bids.items(), key=lambda kv: -kv[0])[:CFG.depth_levels]
+    top_asks = sorted(STATE.local_asks.items(), key=lambda kv: kv[0])[:CFG.depth_levels]
+    bid_vol = sum(q for _, q in top_bids)
+    ask_vol = sum(q for _, q in top_asks)
     total = bid_vol + ask_vol
     if total == 0:
         return 0.0
@@ -164,8 +165,8 @@ def compute_absorption() -> float:
     prices = [t.price for t in window_trades]
     price_range_pct = (max(prices) - min(prices)) / min(prices) * 100 if min(prices) > 0 else 0
 
-    buy_vol = sum(t.qty for t in window_trades if not t.is_buyer_maker)
-    sell_vol = sum(t.qty for t in window_trades if t.is_buyer_maker)
+    buy_vol = sum(t.qty for t in window_trades if t.side == "buy")
+    sell_vol = sum(t.qty for t in window_trades if t.side == "sell")
     total_vol = buy_vol + sell_vol
     if total_vol == 0:
         return 0.0
@@ -174,7 +175,6 @@ def compute_absorption() -> float:
         return 0.0  # dar range değil, absorbsiyon sayılmaz
 
     dominant_side = (buy_vol - sell_vol) / total_vol
-    # agresif taraf kazanamadıysa (fiyat sıkışmış), karşı taraf absorbe ediyor demektir.
     return -dominant_side
 
 
@@ -198,8 +198,8 @@ def compute_delta_divergence(window_sec: int) -> float:
         return trades[-1].price - trades[0].price if len(trades) >= 2 else 0.0
 
     def delta(trades):
-        b = sum(t.qty for t in trades if not t.is_buyer_maker)
-        s = sum(t.qty for t in trades if t.is_buyer_maker)
+        b = sum(t.qty for t in trades if t.side == "buy")
+        s = sum(t.qty for t in trades if t.side == "sell")
         return b - s
 
     price_chg2 = price_change(second_half)
@@ -243,65 +243,70 @@ def compute_combined_score() -> dict:
         "price": STATE.last_price,
     }
 
-# ================== HACİM PROFİLİ (REST klines tabanlı) ==================
+# ================== HACİM PROFİLİ (REST /history tabanlı, gerçek buy/sell) ==================
 
-def fetch_klines_sync(symbol: str, interval: str, limit: int) -> List[dict]:
-    """Binance Futures public klines endpoint'i (API key gerektirmez)."""
-    url = "https://fapi.binance.com/fapi/v1/klines"
-    params = {"symbol": symbol.upper(), "interval": interval, "limit": limit}
-    headers = {}
-    if CFG.binance_api_key:
-        headers["X-MBX-APIKEY"] = CFG.binance_api_key  # opsiyonel, sadece rate-limit için
-
-    r = requests.get(url, params=params, headers=headers, timeout=10)
+def fetch_trade_history_page(symbol: str, last_time: str = None) -> list:
+    url = f"{KRAKEN_FUTURES_REST}/history"
+    params = {"symbol": symbol}
+    if last_time:
+        params["lastTime"] = last_time
+    r = requests.get(url, params=params, timeout=10)
     r.raise_for_status()
-    raw = r.json()
-
-    candles = []
-    for k in raw:
-        volume = float(k[5])
-        buy_vol = float(k[9])   # taker buy base asset volume -> gerçek alıcı hacmi
-        candles.append({
-            "open": float(k[1]),
-            "high": float(k[2]),
-            "low": float(k[3]),
-            "close": float(k[4]),
-            "volume": volume,
-            "buy_vol": buy_vol,
-            "sell_vol": max(volume - buy_vol, 0.0),
-        })
-    return candles
+    data = r.json()
+    return data.get("history", [])
 
 
-def compute_volume_profile(candles: List[dict], num_bins: int, va_percent: float,
-                            hvn_mult: float, lvn_mult: float) -> dict:
+def fetch_recent_trades_sync(symbol: str, max_trades: int, max_pages: int) -> list:
+    """Kraken /history sayfa başı 100 trade döner, geriye doğru sayfalayarak toplar."""
+    all_trades: list = []
+    last_time = None
+    for _ in range(max_pages):
+        page = fetch_trade_history_page(symbol, last_time)
+        if not page:
+            break
+        all_trades.extend(page)
+        if len(all_trades) >= max_trades:
+            break
+        last_time = page[-1].get("time")   # liste zamana göre azalan sıralı
+        time.sleep(0.2)   # nazik rate-limit
+    return all_trades[:max_trades]
+
+
+def compute_volume_profile_from_trades(trades: list, num_bins: int, va_percent: float,
+                                        hvn_mult: float, lvn_mult: float) -> dict:
     """
-    Pine Script'teki POC/VAH/VAL/HVN/LVN mantığının Python karşılığı.
-    Fark: buy/sell ayrımı klines'in gerçek 'taker buy volume' alanından
-    geliyor (OHLC yaklaşıklaması değil, gerçek veri).
+    POC/VAH/VAL/HVN/LVN hesaplar. Binance versiyonundan farkı: burada her
+    trade tek bir fiyat noktası (candle range değil), bu yüzden binleme
+    doğrudan indeks hesabıyla yapılıyor.
     """
-    highs = [c["high"] for c in candles]
-    lows = [c["low"] for c in candles]
-    hi = max(highs)
-    lo = min(lows)
-    bin_size = (hi - lo) / num_bins if num_bins > 0 else 0.0
+    prices = [float(t["price"]) for t in trades]
+    if not prices:
+        return {"poc": 0.0, "vah": 0.0, "val": 0.0, "hvn": [], "lvn": [], "hi": 0.0, "lo": 0.0}
+
+    hi = max(prices)
+    lo = min(prices)
+    bin_size = (hi - lo) / num_bins if num_bins > 0 and hi > lo else 0.0
 
     buy_bins = [0.0] * num_bins
     sell_bins = [0.0] * num_bins
 
-    for c in candles:
-        h, l = c["high"], c["low"]
-        vbuy, vsell = c["buy_vol"], c["sell_vol"]
-        for b in range(num_bins):
-            bin_low = lo + b * bin_size
-            bin_high = bin_low + bin_size
-            if h >= bin_low and l <= bin_high:
-                buy_bins[b] += vbuy
-                sell_bins[b] += vsell
+    for t in trades:
+        price = float(t["price"])
+        qty = float(t.get("size", t.get("qty", 0.0)))
+        side = t.get("side")
+        if bin_size > 0:
+            b = int((price - lo) / bin_size)
+            b = min(max(b, 0), num_bins - 1)
+        else:
+            b = 0
+        if side == "buy":
+            buy_bins[b] += qty
+        else:
+            sell_bins[b] += qty
 
     total_bins = [buy_bins[i] + sell_bins[i] for i in range(num_bins)]
     total_vol = sum(total_bins)
-    if total_vol == 0 or num_bins == 0:
+    if total_vol == 0:
         return {"poc": 0.0, "vah": 0.0, "val": 0.0, "hvn": [], "lvn": [], "hi": hi, "lo": lo}
 
     max_total = max(total_bins)
@@ -344,23 +349,25 @@ def compute_volume_profile(candles: List[dict], num_bins: int, va_percent: float
 
 
 async def profile_loop():
-    """Periyodik olarak REST'ten kline çekip hacim profilini yeniden hesaplar."""
+    """Periyodik olarak REST'ten gerçek trade geçmişi çekip hacim profilini hesaplar."""
     while True:
         try:
-            candles = await asyncio.to_thread(
-                fetch_klines_sync, CFG.symbol, CFG.profile_interval, CFG.profile_limit)
-            if candles:
-                profile = compute_volume_profile(
-                    candles, CFG.profile_bins, CFG.va_percent, CFG.hvn_mult, CFG.lvn_mult)
+            trades = await asyncio.to_thread(
+                fetch_recent_trades_sync, CFG.symbol, CFG.profile_max_trades, CFG.profile_max_pages)
+            if len(trades) >= 20:
+                profile = compute_volume_profile_from_trades(
+                    trades, CFG.profile_bins, CFG.va_percent, CFG.hvn_mult, CFG.lvn_mult)
                 STATE.vp_poc = profile["poc"]
                 STATE.vp_vah = profile["vah"]
                 STATE.vp_val = profile["val"]
                 STATE.vp_hvn = profile["hvn"]
                 STATE.vp_lvn = profile["lvn"]
                 STATE.vp_updated_ts = time.time()
-                log.info("Hacim profili güncellendi: POC=%.2f VAH=%.2f VAL=%.2f (HVN=%d, LVN=%d)",
-                          profile["poc"], profile["vah"], profile["val"],
+                log.info("Hacim profili güncellendi (%d trade): POC=%.2f VAH=%.2f VAL=%.2f (HVN=%d, LVN=%d)",
+                          len(trades), profile["poc"], profile["vah"], profile["val"],
                           len(profile["hvn"]), len(profile["lvn"]))
+            else:
+                log.warning("Hacim profili için yeterli trade verisi yok (%d)", len(trades))
         except Exception as e:
             log.error("Hacim profili güncelleme hatası: %s", e)
         await asyncio.sleep(CFG.profile_refresh_sec)
@@ -433,7 +440,7 @@ async def signal_loop():
             level_line = "— VP seviyesi henüz hesaplanmadı"
 
         msg = (
-            f"<b>{CFG.symbol.upper()} Order Flow Sinyali</b>\n"
+            f"<b>{CFG.symbol} Order Flow Sinyali (Kraken Futures)</b>\n"
             f"Yön: {side_txt}\n"
             f"Fiyat: {result['price']:.2f}\n"
             f"Skor: {score:.2f}\n"
@@ -448,78 +455,95 @@ async def signal_loop():
         log.info("SİNYAL: %s", msg.replace("\n", " | "))
         send_telegram(msg)
 
-# ================== WEBSOCKET DİNLEYİCİLER ==================
+# ================== WEBSOCKET DİNLEYİCİ ==================
+
+def handle_trade_item(item: dict) -> None:
+    try:
+        trade = Trade(
+            ts=float(item["time"]) / 1000.0,
+            price=float(item["price"]),
+            qty=float(item["qty"]),
+            side=item.get("side", "buy"),
+        )
+        STATE.trades.append(trade)
+        STATE.last_price = trade.price
+    except (KeyError, ValueError, TypeError) as e:
+        log.debug("trade parse hatası: %s", e)
+
+
+def handle_book_snapshot(msg: dict) -> None:
+    try:
+        STATE.local_bids = {float(b["price"]): float(b["qty"]) for b in msg.get("bids", [])}
+        STATE.local_asks = {float(a["price"]): float(a["qty"]) for a in msg.get("asks", [])}
+    except (KeyError, ValueError, TypeError) as e:
+        log.debug("book_snapshot parse hatası: %s", e)
+
+
+def handle_book_delta(msg: dict) -> None:
+    try:
+        side = msg.get("side")
+        price = float(msg["price"])
+        qty = float(msg["qty"])
+        book = STATE.local_bids if side == "buy" else STATE.local_asks
+        if qty == 0:
+            book.pop(price, None)
+        else:
+            book[price] = qty
+    except (KeyError, ValueError, TypeError) as e:
+        log.debug("book delta parse hatası: %s", e)
+
 
 async def stream_listener():
-    streams = f"{CFG.symbol}@aggTrade/{CFG.symbol}@depth{CFG.depth_levels}@100ms"
-    url = f"{BINANCE_FUTURES_WS}?streams={streams}"
+    sub_trade = json.dumps({"event": "subscribe", "feed": "trade", "product_ids": [CFG.symbol]})
+    sub_book = json.dumps({"event": "subscribe", "feed": "book", "product_ids": [CFG.symbol]})
 
     while True:
         try:
-            async with websockets.connect(url, ping_interval=15, ping_timeout=10) as ws:
-                log.info("WebSocket bağlantısı kuruldu: %s", url)
+            async with websockets.connect(KRAKEN_FUTURES_WS, ping_interval=15, ping_timeout=10) as ws:
+                await ws.send(sub_trade)
+                await ws.send(sub_book)
+                log.info("WebSocket bağlantısı kuruldu: %s (symbol=%s)", KRAKEN_FUTURES_WS, CFG.symbol)
+
                 async for raw in ws:
                     msg = json.loads(raw)
-                    data = msg.get("data", {})
-                    stream = msg.get("stream", "")
+                    feed = msg.get("feed")
+                    event = msg.get("event")
 
-                    if stream.endswith("@aggTrade"):
-                        handle_agg_trade(data)
-                    elif "@depth" in stream:
-                        handle_depth(data)
+                    if feed == "trade_snapshot":
+                        for item in msg.get("trades", []):
+                            handle_trade_item(item)
+                    elif feed == "trade":
+                        handle_trade_item(msg)
+                    elif feed == "book_snapshot":
+                        handle_book_snapshot(msg)
+                    elif feed == "book":
+                        handle_book_delta(msg)
+                    elif event == "subscribed":
+                        log.info("Abone olundu: feed=%s", msg.get("feed"))
+                    elif event == "error":
+                        log.error("WS hata mesajı: %s", msg.get("message"))
 
         except Exception as e:
             log.error("WebSocket hatası, 5sn sonra yeniden bağlanılıyor: %s", e)
             await asyncio.sleep(5)
 
-
-def handle_agg_trade(data: dict) -> None:
-    try:
-        trade = Trade(
-            ts=data["T"] / 1000.0,
-            price=float(data["p"]),
-            qty=float(data["q"]),
-            is_buyer_maker=bool(data["m"]),
-        )
-        STATE.trades.append(trade)
-        STATE.last_price = trade.price
-    except (KeyError, ValueError) as e:
-        log.debug("aggTrade parse hatası: %s", e)
-
-
-def handle_depth(data: dict) -> None:
-    try:
-        bids = data.get("b", [])
-        asks = data.get("a", [])
-        STATE.bid_levels = [(float(p), float(q)) for p, q in bids]
-        STATE.ask_levels = [(float(p), float(q)) for p, q in asks]
-        if STATE.bid_levels:
-            STATE.best_bid = STATE.bid_levels[0][0]
-        if STATE.ask_levels:
-            STATE.best_ask = STATE.ask_levels[0][0]
-    except (KeyError, ValueError) as e:
-        log.debug("depth parse hatası: %s", e)
-
 # ================== GİRİŞ NOKTASI ==================
 
 async def main():
-    parser = argparse.ArgumentParser(description="Binance Futures Order Flow -> Telegram Bot")
-    parser.add_argument("--symbol", default=CFG.symbol, help="Örn: btcusdt, ethusdt")
+    parser = argparse.ArgumentParser(description="Kraken Futures Order Flow -> Telegram Bot")
+    parser.add_argument("--symbol", default=CFG.symbol,
+                         help="Kraken Futures sembolü, örn: PI_XBTUSD, PI_ETHUSD")
     parser.add_argument("--score-threshold", type=float, default=CFG.combined_score_threshold)
-    parser.add_argument("--profile-interval", default=CFG.profile_interval,
-                         help="Hacim profili için kline periyodu, örn: 1m, 5m, 15m")
     parser.add_argument("--require-confluence", action="store_true",
-                         help="Sadece fiyat bir VP seviyesine yakınken alert gönder")
+                         help="Sadece fiyat bir VP seviyesine (POC/VAH/VAL) yakınken alert gönder")
     args = parser.parse_args()
 
-    CFG.symbol = args.symbol.lower()
+    CFG.symbol = args.symbol
     CFG.combined_score_threshold = args.score_threshold
-    CFG.profile_interval = args.profile_interval
     CFG.require_level_confluence = args.require_confluence
 
-    log.info("Başlatılıyor: symbol=%s, threshold=%.2f, profile_interval=%s, require_confluence=%s",
-              CFG.symbol, CFG.combined_score_threshold, CFG.profile_interval,
-              CFG.require_level_confluence)
+    log.info("Başlatılıyor: symbol=%s, threshold=%.2f, require_confluence=%s",
+              CFG.symbol, CFG.combined_score_threshold, CFG.require_level_confluence)
 
     await asyncio.gather(
         stream_listener(),

@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       symbol:
-        description: "Sembol (örn: btcusdt, ethusdt)"
+        description: "Kraken Futures sembolü (örn: PI_XBTUSD, PI_ETHUSD)"
         required: false
-        default: "btcusdt"
+        default: "PI_XBTUSD"
       score_threshold:
         description: "Sinyal skor eşiği (0-1)"
         required: false
@@ -46,9 +46,8 @@ jobs:
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          BINANCE_API_KEY: ${{ secrets.BINANCE_API_KEY }}
         run: |
-          ARGS="--symbol ${{ github.event.inputs.symbol || 'btcusdt' }} --score-threshold ${{ github.event.inputs.score_threshold || '0.6' }}"
+          ARGS="--symbol ${{ github.event.inputs.symbol || 'PI_XBTUSD' }} --score-threshold ${{ github.event.inputs.score_threshold || '0.6' }}"
           if [ "${{ github.event.inputs.require_confluence }}" = "true" ]; then
             ARGS="$ARGS --require-confluence"
           fi
