@@ -15,12 +15,7 @@ on:
       score_threshold:
         description: "Sinyal skor eşiği (0-1)"
         required: false
-        default: "0.6"
-      require_confluence:
-        description: "Sadece VP seviyesine yakınken alert gönder"
-        type: boolean
-        required: false
-        default: false
+        default: "0.4"
       send_test_signal:
         description: "Gerçek veri beklemeden örnek bir sinyal mesajı gönder ve çık"
         type: boolean
@@ -76,10 +71,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          ARGS="--symbol ${{ matrix.symbol }} --score-threshold ${{ github.event.inputs.score_threshold || '0.6' }}"
-          if [ "${{ github.event.inputs.require_confluence }}" = "true" ]; then
-            ARGS="$ARGS --require-confluence"
-          fi
+          ARGS="--symbol ${{ matrix.symbol }} --score-threshold ${{ github.event.inputs.score_threshold || '0.4' }} --require-confluence"
           if [ "${{ github.event.inputs.send_test_signal }}" = "true" ]; then
             ARGS="$ARGS --send-test-signal"
           fi
