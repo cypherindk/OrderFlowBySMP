@@ -9,9 +9,9 @@ on:
   workflow_dispatch:
     inputs:
       symbols:
-        description: 'JSON dizi olarak semboller, örn: ["PI_XBTUSD","PI_ETHUSD"]'
+        description: 'Boş bırak = en likit 20 otomatik seçilir. Ya da JSON dizi ver: ["PI_XBTUSD","PI_ETHUSD"]'
         required: false
-        default: '["PI_XBTUSD","PI_ETHUSD","PI_SOLUSD"]'
+        default: ""
       score_threshold:
         description: "Sinyal skor eşiği (0-1)"
         required: false
@@ -28,13 +28,34 @@ on:
         default: false
 
 jobs:
+  select-symbols:
+    runs-on: ubuntu-latest
+    outputs:
+      symbols: ${{ steps.pick.outputs.symbols }}
+    steps:
+      - name: En likit 20 perpetual sembolü Kraken'den canlı seç
+        id: pick
+        run: |
+          curl -s "https://futures.kraken.com/derivatives/api/v3/tickers" -o tickers.json
+          SYMBOLS=$(jq -c '
+            [.tickers[]
+              | select(.tag == "perpetual" and .vol24h != null)
+              | {symbol: (.symbol | ascii_upcase), vol24h: (.vol24h | tonumber)}]
+            | sort_by(-.vol24h)
+            | .[0:20]
+            | map(.symbol)
+          ' tickers.json)
+          echo "symbols=$SYMBOLS" >> "$GITHUB_OUTPUT"
+          echo "Seçilen semboller (24s hacme göre en likit 20): $SYMBOLS"
+
   run-bot:
+    needs: select-symbols
     runs-on: ubuntu-latest
     timeout-minutes: 350   # GitHub'ın 360dk (6 saat) sert sınırından önce kendi isteğimizle bitir
     strategy:
       fail-fast: false
       matrix:
-        symbol: ${{ fromJson(github.event.inputs.symbols || '["PI_XBTUSD","PI_ETHUSD","PI_SOLUSD"]') }}
+        symbol: ${{ fromJson(github.event.inputs.symbols || needs.select-symbols.outputs.symbols) }}
     concurrency:
       group: orderflow-bot-${{ matrix.symbol }}
       cancel-in-progress: false
