@@ -8,10 +8,10 @@ on:
     - cron: "0 */6 * * *"
   workflow_dispatch:
     inputs:
-      symbol:
-        description: "Kraken Futures sembolü (örn: PI_XBTUSD, PI_ETHUSD)"
+      symbols:
+        description: 'JSON dizi olarak semboller, örn: ["PI_XBTUSD","PI_ETHUSD"]'
         required: false
-        default: "PI_XBTUSD"
+        default: '["PI_XBTUSD","PI_ETHUSD","PI_SOLUSD"]'
       score_threshold:
         description: "Sinyal skor eşiği (0-1)"
         required: false
@@ -27,14 +27,17 @@ on:
         required: false
         default: false
 
-concurrency:
-  group: orderflow-bot
-  cancel-in-progress: false
-
 jobs:
   run-bot:
     runs-on: ubuntu-latest
     timeout-minutes: 350   # GitHub'ın 360dk (6 saat) sert sınırından önce kendi isteğimizle bitir
+    strategy:
+      fail-fast: false
+      matrix:
+        symbol: ${{ fromJson(github.event.inputs.symbols || '["PI_XBTUSD","PI_ETHUSD","PI_SOLUSD"]') }}
+    concurrency:
+      group: orderflow-bot-${{ matrix.symbol }}
+      cancel-in-progress: false
     steps:
       - name: Repo checkout
         uses: actions/checkout@v4
@@ -47,12 +50,12 @@ jobs:
       - name: Bağımlılıkları yükle
         run: pip install -r requirements.txt
 
-      - name: Botu çalıştır
+      - name: Botu çalıştır (${{ matrix.symbol }})
         env:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
-          ARGS="--symbol ${{ github.event.inputs.symbol || 'PI_XBTUSD' }} --score-threshold ${{ github.event.inputs.score_threshold || '0.6' }}"
+          ARGS="--symbol ${{ matrix.symbol }} --score-threshold ${{ github.event.inputs.score_threshold || '0.6' }}"
           if [ "${{ github.event.inputs.require_confluence }}" = "true" ]; then
             ARGS="$ARGS --require-confluence"
           fi
