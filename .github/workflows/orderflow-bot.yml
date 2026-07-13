@@ -21,6 +21,11 @@ on:
         type: boolean
         required: false
         default: false
+      send_test_signal:
+        description: "Gerçek veri beklemeden örnek bir sinyal mesajı gönder ve çık"
+        type: boolean
+        required: false
+        default: false
 
 concurrency:
   group: orderflow-bot
@@ -50,5 +55,8 @@ jobs:
           ARGS="--symbol ${{ github.event.inputs.symbol || 'PI_XBTUSD' }} --score-threshold ${{ github.event.inputs.score_threshold || '0.6' }}"
           if [ "${{ github.event.inputs.require_confluence }}" = "true" ]; then
             ARGS="$ARGS --require-confluence"
+          fi
+          if [ "${{ github.event.inputs.send_test_signal }}" = "true" ]; then
+            ARGS="$ARGS --send-test-signal"
           fi
           python orderflow_bot.py $ARGS
