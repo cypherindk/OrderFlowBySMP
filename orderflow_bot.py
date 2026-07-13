@@ -398,6 +398,31 @@ def nearest_level_info(price: float) -> dict:
 
 # ================== SİNYAL DEĞERLENDİRME DÖNGÜSÜ ==================
 
+def build_signal_message(direction: int, result: dict, lvl_info: dict, confluence: bool) -> str:
+    side_txt = "LONG (Alış) 🟢" if direction == 1 else "SHORT (Satış) 🔴"
+
+    if lvl_info["name"] is not None:
+        level_line = (f"— En yakın VP seviyesi: {lvl_info['name']} "
+                      f"({lvl_info['level']:.2f}, {lvl_info['dist_pct']:.2f}% uzaklıkta)"
+                      + (" ✅ teyit" if confluence else ""))
+    else:
+        level_line = "— VP seviyesi henüz hesaplanmadı"
+
+    return (
+        f"<b>{CFG.symbol} Order Flow Sinyali (Kraken Futures)</b>\n"
+        f"Yön: {side_txt}\n"
+        f"Fiyat: {result['price']:.2f}\n"
+        f"Skor: {result['score']:.2f}\n"
+        f"— Imbalance: {result['imbalance']:.2f}\n"
+        f"— Delta({CFG.delta_window_sec}s): {result['delta']:.2f} (norm {result['delta_norm']:.2f})\n"
+        f"— Absorbsiyon: {result['absorption']:.2f}\n"
+        f"— Delta Divergence: {result['divergence']:.2f}\n"
+        f"{level_line}\n"
+        f"— VP: POC {STATE.vp_poc:.2f} | VAH {STATE.vp_vah:.2f} | VAL {STATE.vp_val:.2f}\n"
+        f"\n⚠️ Bu otomatik bir sinyaldir, yatırım tavsiyesi değildir."
+    )
+
+
 async def signal_loop():
     loop_count = 0
     while True:
@@ -446,28 +471,7 @@ async def signal_loop():
         STATE.last_alert_ts = now
         STATE.last_alert_dir = direction
 
-        side_txt = "LONG (Alış) 🟢" if direction == 1 else "SHORT (Satış) 🔴"
-
-        if lvl_info["name"] is not None:
-            level_line = (f"— En yakın VP seviyesi: {lvl_info['name']} "
-                          f"({lvl_info['level']:.2f}, {lvl_info['dist_pct']:.2f}% uzaklıkta)"
-                          + (" ✅ teyit" if confluence else ""))
-        else:
-            level_line = "— VP seviyesi henüz hesaplanmadı"
-
-        msg = (
-            f"<b>{CFG.symbol} Order Flow Sinyali (Kraken Futures)</b>\n"
-            f"Yön: {side_txt}\n"
-            f"Fiyat: {result['price']:.2f}\n"
-            f"Skor: {score:.2f}\n"
-            f"— Imbalance: {result['imbalance']:.2f}\n"
-            f"— Delta({CFG.delta_window_sec}s): {result['delta']:.2f} (norm {result['delta_norm']:.2f})\n"
-            f"— Absorbsiyon: {result['absorption']:.2f}\n"
-            f"— Delta Divergence: {result['divergence']:.2f}\n"
-            f"{level_line}\n"
-            f"— VP: POC {STATE.vp_poc:.2f} | VAH {STATE.vp_vah:.2f} | VAL {STATE.vp_val:.2f}\n"
-            f"\n⚠️ Bu otomatik bir sinyaldir, yatırım tavsiyesi değildir."
-        )
+        msg = build_signal_message(direction, result, lvl_info, confluence)
         log.info("SİNYAL: %s", msg.replace("\n", " | "))
         send_telegram(msg)
 
@@ -552,11 +556,33 @@ async def main():
     parser.add_argument("--score-threshold", type=float, default=CFG.combined_score_threshold)
     parser.add_argument("--require-confluence", action="store_true",
                          help="Sadece fiyat bir VP seviyesine (POC/VAH/VAL) yakınken alert gönder")
+    parser.add_argument("--send-test-signal", action="store_true",
+                         help="Sahte ama gerçekçi bir sinyal mesajı gönderip çık (websocket'e bağlanmaz)")
     args = parser.parse_args()
 
     CFG.symbol = args.symbol
     CFG.combined_score_threshold = args.score_threshold
     CFG.require_level_confluence = args.require_confluence
+
+    if args.send_test_signal:
+        # Sahte ama gerçekçi bir sonuç seti - gerçek sinyal mesajının nasıl göründüğünü test etmek için.
+        STATE.vp_poc = 64007.94
+        STATE.vp_vah = 64025.62
+        STATE.vp_val = 63990.25
+        fake_result = {
+            "price": 64012.50,
+            "score": 0.72,
+            "imbalance": 0.65,
+            "delta": 128.4,
+            "delta_norm": 0.58,
+            "absorption": 0.30,
+            "divergence": 0.15,
+        }
+        fake_lvl_info = {"name": "POC", "level": STATE.vp_poc, "dist_pct": 0.01}
+        msg = build_signal_message(direction=1, result=fake_result, lvl_info=fake_lvl_info, confluence=True)
+        log.info("TEST SİNYALİ gönderiliyor: %s", msg.replace("\n", " | "))
+        send_telegram(msg)
+        return
 
     log.info("Başlatılıyor: symbol=%s, threshold=%.2f, require_confluence=%s",
               CFG.symbol, CFG.combined_score_threshold, CFG.require_level_confluence)
